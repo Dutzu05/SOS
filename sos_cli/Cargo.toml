@@ -1,0 +1,12 @@
+[package]
+name = "sos-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sos"
+path = "src/main.rs"
+
+[dependencies]
+sos-core = { path = "../sos_core" }
+clap = { version = "4", features = ["derive"] }
