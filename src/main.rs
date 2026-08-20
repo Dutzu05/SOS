@@ -20,7 +20,7 @@ fn main() {
         println!("[sensor_app] sending: {:?}", reading);
         tx.send(reading).unwrap();
         // Try uncommenting the next line after your first successful run:
-        println!("{:?}", reading);
+        //println!("{:?}", reading);
     });
 
     // Meanwhile, our "main" app acts as the receiver.
