@@ -13,5 +13,8 @@ pub enum AppError {
 
     #[error("shutdown did not complete cleanly: {0}")]
     ShutdownFailed(String),
+
+    #[error("(de)serialization error: {0}")]
+    Serialization(String),
 }
 

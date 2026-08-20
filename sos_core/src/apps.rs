@@ -41,7 +41,7 @@ pub struct HeartbeatApp;
 impl App for HeartbeatApp {
     fn tick(&mut self, bus: &BusHandle) -> Result<(), AppError> {
         bus.send(BusMessage::Heartbeat {
-            app_name: "heartbeat",
+            app_name: "heartbeat".to_string(),
         })
     }
 
@@ -55,6 +55,7 @@ pub struct BatteryApp {
     charge_level: f32,
     drain_rate: f32,
     fault_threshold: f32,
+    faulted: bool,          // NEW — have we already reported the fault?
 }
 
 impl BatteryApp {
@@ -64,6 +65,7 @@ impl BatteryApp {
             charge_level: 100.0, // Starts fully charged
             drain_rate: 5.5,     // How much it drains per tick
             fault_threshold: 15.0, // Throws an error below this level
+            faulted: false,
         }
     }
 }impl App for BatteryApp {
@@ -73,8 +75,15 @@ impl BatteryApp {
     }
 
     fn tick(&mut self, bus: &BusHandle) -> Result<(), AppError> {
+        if self.faulted {
+            // already reported — do nothing until something resets us
+            return Ok(());
+        }
+
         self.charge_level -= self.drain_rate;
+
         if self.charge_level < self.fault_threshold {
+            self.faulted = true;
             return Err(AppError::SensorFault(self.sensor_id));
         }
 

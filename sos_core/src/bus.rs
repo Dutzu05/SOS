@@ -1,12 +1,29 @@
 use std::sync::mpsc;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BusMessage {
     Telemetry { sensor_id: u8, value: f32 },
-    Heartbeat { app_name: &'static str },
-    Log { source: &'static str, text: String },
+    Heartbeat { app_name: String },
+    Log { source: String, text: String },
+    Command { name: String, args: Vec<String> },
+}
+
+impl BusMessage { //Serialize into a sg line of JSON and ready to write into a single line TCP
+    pub fn to_line(&self) -> Result<String, AppError> {
+        let mut json =
+            serde_json::to_string(self).map_err(|e| AppError::Serialization(e.to_string()))?;
+        json.push('\n');
+        Ok(json)
+    }
+
+    //Parse a line produce by to line into BusMessage
+
+    pub fn from_line(line: &str) -> Result<Self, AppError> {
+        serde_json::from_str(line.trim()).map_err(|e| AppError::Serialization(e.to_string()))
+    }
 }
 
 #[derive(Clone)]
