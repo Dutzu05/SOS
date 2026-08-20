@@ -3,12 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-// An enum where each variant can carry its own different data.
-// This is our "message bus protocol" — every message on the bus
-// must be one of these variants.
 #[derive(Debug)]
 enum BusMessage {
     Telemetry { sensor_id: u8, value: f32 },
+    Heartbeat { app_name: &'static str },
 }
 
 trait App: Send {
@@ -22,36 +20,86 @@ struct TempSensorApp {
 impl App for TempSensorApp {
     fn run(&mut self, tx: mpsc::Sender<BusMessage>, shutdown: Arc<AtomicBool>) {
         let mut tick = 0;
-
         while !shutdown.load(Ordering::Relaxed) {
             tick += 1;
-            let msg = BusMessage::Telemetry { sensor_id: 1, value: 20.0 + tick as f32 };
+            let msg = BusMessage::Telemetry {
+                sensor_id: self.sensor_id,
+                value: 20.0 + tick as f32,
+            };
             if tx.send(msg).is_err() {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
+        // tx is dropped here automatically when run() returns
     }
 }
 
-fn spawn_app(mut app: Box<dyn App>, tx: mpsc::Sender<BusMessage>, shutdown: Arc<AtomicBool>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        app.run(tx, shutdown)
-    })
+struct HeartbeatApp;
+
+impl App for HeartbeatApp {
+    fn run(&mut self, tx: mpsc::Sender<BusMessage>, shutdown: Arc<AtomicBool>) {
+        while !shutdown.load(Ordering::Relaxed) {
+            let msg = BusMessage::Heartbeat {
+                app_name: "heartbeat",
+            };
+            if tx.send(msg).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    }
+}
+
+struct Bus {
+    tx: mpsc::Sender<BusMessage>,
+    rx: mpsc::Receiver<BusMessage>,
+    shutdown: Arc<AtomicBool>,
+    handles: Vec<thread::JoinHandle<()>>,
+}
+
+impl Bus {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<BusMessage>();
+
+        Bus {
+            tx,
+            rx,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            handles: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, mut app: Box<dyn App>) {
+        let tx = self.tx.clone();
+        let shutdown = Arc::clone(&self.shutdown);
+        let handle = thread::spawn(move || {
+            app.run(tx, shutdown);
+        });
+        self.handles.push(handle);
+    }
+
+    fn run(self, duration: Duration) {
+        let Bus{ tx, rx, shutdown, handles } = self;
+        thread::sleep(duration);
+        shutdown.store(true, Ordering::Relaxed);
+
+        drop(tx);
+        for msg in rx {
+            println!("[bus] receive{:?}", msg);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+    }
 }
 
 fn main() {
-    let (tx, rx) = mpsc::channel::<BusMessage>();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let app = Box::new(TempSensorApp { sensor_id: 1 });
-    let handle = spawn_app(app, tx, Arc::clone(&shutdown));
+    let mut bus = Bus::new();
 
-    thread::sleep(Duration::from_millis(500));
-    shutdown.store(true, Ordering::Relaxed);
+    bus.register(Box::new(TempSensorApp{sensor_id: 1}));
+    bus.register(Box::new(HeartbeatApp{}));
 
-    while let Ok(msg) = rx.recv() {
-        println!("[main app] has {:?}", msg);
-    }
-    handle.join().unwrap();
-
+    bus.run(Duration::from_millis(500));
 }
