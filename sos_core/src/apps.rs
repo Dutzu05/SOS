@@ -49,3 +49,42 @@ impl App for HeartbeatApp {
         "heartbeat"
     }
 }
+
+pub struct BatteryApp {
+    sensor_id: u8,
+    charge_level: f32,
+    drain_rate: f32,
+    fault_threshold: f32,
+}
+
+impl BatteryApp {
+    pub fn new(sensor_id: u8) -> Self {
+        BatteryApp {
+            sensor_id,
+            charge_level: 100.0, // Starts fully charged
+            drain_rate: 5.5,     // How much it drains per tick
+            fault_threshold: 15.0, // Throws an error below this level
+        }
+    }
+}impl App for BatteryApp {
+    fn init(&mut self) -> Result<(), AppError> {
+        self.charge_level = 100.0;
+        Ok(())
+    }
+
+    fn tick(&mut self, bus: &BusHandle) -> Result<(), AppError> {
+        self.charge_level -= self.drain_rate;
+        if self.charge_level < self.fault_threshold {
+            return Err(AppError::SensorFault(self.sensor_id));
+        }
+
+        bus.send(BusMessage::Telemetry {
+            sensor_id: self.sensor_id,
+            value: self.charge_level,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "battery_app"
+    }
+}

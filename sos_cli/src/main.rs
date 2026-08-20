@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use sos_core::apps::{HeartbeatApp, TempSensorApp};
+use sos_core::apps::{HeartbeatApp, TempSensorApp, BatteryApp};
 use sos_core::Scheduler;
 
 #[derive(Parser)]
@@ -31,7 +31,7 @@ fn main(){
             let mut scheduler = Scheduler::new();
             scheduler.register(Box::new(TempSensorApp::new(1)));
             scheduler.register(Box::new(HeartbeatApp));
-
+            scheduler.register(Box::new(BatteryApp::new(2)));
             println!("[cli] running {ticks} ticks at {interval_ms}ms interval");
             scheduler.run(ticks, Duration::from_millis(interval_ms));
         }
