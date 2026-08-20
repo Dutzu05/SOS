@@ -1,31 +1,40 @@
 use std::sync::mpsc;
 use std::thread;
 
-// This struct represents a message on our software bus.
-// Think of it as a tiny "telemetry packet."
+// An enum where each variant can carry its own different data.
+// This is our "message bus protocol" — every message on the bus
+// must be one of these variants.
 #[derive(Debug)]
-struct SensorReading {
-    sensor_id: u8,
-    value: f32,
+enum BusMessage {
+    Telemetry { sensor_id: u8, value: f32 },
+    Command { target_app: String, action: String },
+    Error(String),
 }
 
 fn main() {
-    // Create a channel. `tx` (transmitter) is how apps send messages.
-    // `rx` (receiver) is how an app receives them.
-    let (tx, rx) = mpsc::channel::<SensorReading>();
+    let (tx, rx) = mpsc::channel::<BusMessage>();
 
-    // Spawn a thread to simulate our "sensor app" running independently.
     let sensor_app = thread::spawn(move || {
-        let reading = SensorReading { sensor_id: 1, value: 23.7 };
-        println!("[sensor_app] sending: {:?}", reading);
-        tx.send(reading).unwrap();
-        // Try uncommenting the next line after your first successful run:
-        //println!("{:?}", reading);
+        let msg = BusMessage::Telemetry { sensor_id: 1, value: 23.7 };
+        println!("[sensor_app] sending: {:?}", msg);
+        tx.send(msg).unwrap();
     });
 
-    // Meanwhile, our "main" app acts as the receiver.
     let received = rx.recv().unwrap();
-    println!("[main_app] received: {:?}", received);
+
+    // `match` forces you to handle every possible variant.
+    // This is Rust's answer to "what if I forget to handle a message type?"
+    match received {
+        BusMessage::Telemetry { sensor_id, value } => {
+            println!("[main_app] telemetry from sensor {}: {}", sensor_id, value);
+        }
+        BusMessage::Command { target_app, action } => {
+            println!("[main_app] command for {}: {}", target_app, action);
+        }
+        BusMessage::Error(msg) => {
+            println!("[main_app] error: {}", msg);
+        }
+    }
 
     sensor_app.join().unwrap();
 }
