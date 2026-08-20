@@ -11,31 +11,47 @@ enum BusMessage {
     Telemetry { sensor_id: u8, value: f32 },
 }
 
-fn main() {
-    let (tx, rx) = mpsc::channel::<BusMessage>();
+trait App: Send {
+    fn run(&mut self, tx: mpsc::Sender<BusMessage>, shutdown: Arc<AtomicBool>);
+}
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_for_app = Arc::clone(&shutdown);
+struct TempSensorApp {
+    sensor_id: u8,
+}
 
-    let sensor_app = thread::spawn(move || {
+impl App for TempSensorApp {
+    fn run(&mut self, tx: mpsc::Sender<BusMessage>, shutdown: Arc<AtomicBool>) {
         let mut tick = 0;
 
-        while !shutdown_for_app.load(Ordering::Relaxed) {
-            tick+=1;
-            let msg = BusMessage::Telemetry {sensor_id: 1, value: 20.0 + tick as f32};
+        while !shutdown.load(Ordering::Relaxed) {
+            tick += 1;
+            let msg = BusMessage::Telemetry { sensor_id: 1, value: 20.0 + tick as f32 };
             if tx.send(msg).is_err() {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        println!("Shutting down...");
-    });
+    }
+}
+
+fn spawn_app(mut app: Box<dyn App>, tx: mpsc::Sender<BusMessage>, shutdown: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        app.run(tx, shutdown)
+    })
+}
+
+fn main() {
+    let (tx, rx) = mpsc::channel::<BusMessage>();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let app = Box::new(TempSensorApp { sensor_id: 1 });
+    let handle = spawn_app(app, tx, Arc::clone(&shutdown));
+
     thread::sleep(Duration::from_millis(500));
     shutdown.store(true, Ordering::Relaxed);
 
-    while let Ok(msg) = rx.try_recv() {
-        println!("[main app] received:{:?}", msg);
+    while let Ok(msg) = rx.recv() {
+        println!("[main app] has {:?}", msg);
     }
-    sensor_app.join().unwrap();
+    handle.join().unwrap();
 
 }
