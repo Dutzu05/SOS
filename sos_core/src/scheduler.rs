@@ -1,37 +1,40 @@
-use std::thread;
-use std::time::Duration;
+use embedded_hal::delay::DelayNs;
+use heapless::Vec as HVec;
 
 use crate::app::App;
+use crate::apps::AnyApp;
 use crate::bus::{Bus, BusHandle, BusMessage};
 
-struct Registered {
+/// Max number of apps a single Scheduler can hold. Bump this if you
+/// register more — heapless containers need their capacity fixed up front.
+pub const MAX_APPS: usize = 8;
+
+/*struct Registered {
     name: String,
     app: Box<dyn App>,
-}
+}*/
 
 pub struct Scheduler {
     bus: Bus,
-    apps: Vec<Registered>,
-    sink: Option<Box<dyn FnMut(&BusMessage) + Send>>,
+    apps: HVec<AnyApp, MAX_APPS>,
+    sink: Option<Box<dyn FnMut(&BusMessage) + Send>>, // still std-only — next step
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Scheduler {
             bus: Bus::new(),
-            apps: Vec::new(),
+            apps: HVec::new(),
             sink: None,
         }
     }
 
-    pub fn register(&mut self, app: Box<dyn App>) {
-        let name = app.name().to_string();
-        self.apps.push(Registered { name, app });
+    pub fn register(&mut self, app: AnyApp) {
+        self.apps
+            .push(app)
+            .unwrap_or_else(|_| panic!("too many apps registered (max {MAX_APPS}) — raise MAX_APPS"));
     }
 
-    /// Get a cloneable handle to the bus before starting the run loop.
-    /// External I/O (like a TCP reader thread) uses this to inject
-    /// messages — e.g. uplinked commands — onto the bus from outside.
     pub fn bus_handle(&self) -> BusHandle {
         self.bus.handle()
     }
@@ -47,19 +50,19 @@ impl Scheduler {
         self.sink = Some(Box::new(sink));
     }
 
-    pub fn run(mut self, ticks: u32, tick_interval: Duration) {
+    pub fn run(mut self, ticks: u32, tick_interval_ms: u32, delay: &mut impl DelayNs) {
         let bus_handle = self.bus.handle();
 
-        for reg in &mut self.apps {
-            if let Err(e) = reg.app.init() {
-                eprintln!("[scheduler] '{}' failed to init: {e}", reg.name);
+        for app in self.apps.iter_mut() {
+            if let Err(e) = app.init() {
+                eprintln!("[scheduler] '{}' failed to init: {e}", app.name());
             }
         }
 
         for tick_num in 1..=ticks {
-            for reg in &mut self.apps {
-                if let Err(e) = reg.app.tick(&bus_handle) {
-                    eprintln!("[scheduler] '{}' tick {tick_num} error: {e}", reg.name);
+            for app in self.apps.iter_mut() {
+                if let Err(e) = app.tick(&bus_handle) {
+                    eprintln!("[scheduler] '{}' tick {tick_num} error: {e}", app.name());
                 }
             }
 
@@ -70,12 +73,12 @@ impl Scheduler {
                 }
             }
 
-            thread::sleep(tick_interval);
+            delay.delay_ms(tick_interval_ms);
         }
 
-        for reg in &mut self.apps {
-            if let Err(e) = reg.app.shutdown() {
-                eprintln!("[scheduler] '{}' failed to shut down: {e}", reg.name);
+        for app in self.apps.iter_mut() {
+            if let Err(e) = app.shutdown() {
+                eprintln!("[scheduler] '{}' failed to shut down: {e}", app.name());
             }
         }
     }

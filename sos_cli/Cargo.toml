@@ -11,3 +11,4 @@ path = "src/main.rs"
 sos-core = { path = "../sos_core" }
 clap = { version = "4", features = ["derive"] }
 heapless = "0.9"
+embedded-hal = "1"

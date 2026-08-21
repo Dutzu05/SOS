@@ -5,8 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use embedded_hal::delay::DelayNs;
 
-use sos_core::apps::{BatteryApp, HeartbeatApp, TempSensorApp};
+use sos_core::apps::{AnyApp, BatteryApp, HeartbeatApp, TempSensorApp};
 use sos_core::{BusMessage, Scheduler};
 
 #[derive(Parser)]
@@ -37,6 +38,14 @@ enum Command {
     },
 }
 
+struct HostDelay;
+
+impl DelayNs for HostDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        thread::sleep(Duration::from_nanos(ns as u64));
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -47,9 +56,9 @@ fn main() {
 
 fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
     let mut scheduler = Scheduler::new();
-    scheduler.register(Box::new(TempSensorApp::new(1)));
-    scheduler.register(Box::new(HeartbeatApp));
-    scheduler.register(Box::new(BatteryApp::new(2)));
+    scheduler.register(AnyApp::TempSensor(TempSensorApp::new(1)));
+    scheduler.register(AnyApp::Heartbeat(HeartbeatApp));
+    scheduler.register(AnyApp::Battery(BatteryApp::new(2)));
 
     // Grab a handle before `run()` takes ownership of the scheduler.
     let bus_handle = scheduler.bus_handle();
@@ -129,7 +138,8 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
     });
 
     println!("[sim] running {ticks} ticks at {interval_ms}ms interval");
-    scheduler.run(ticks, Duration::from_millis(interval_ms));
+    let mut delay = HostDelay;
+    scheduler.run(ticks, interval_ms as u32, &mut delay);
 }
 
 fn ground_control(addr: &str) {

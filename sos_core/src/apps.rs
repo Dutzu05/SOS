@@ -97,3 +97,47 @@ impl BatteryApp {
         "battery_app"
     }
 }
+
+/// Every concrete app type the scheduler can run, wrapped in one enum.
+/// This is the heapless answer to `Box<dyn App>`: no heap allocation, but
+/// every variant has to be listed here by hand — the real cost of the
+/// full-heapless path over `no_std` + `alloc`.
+pub enum AnyApp {
+    TempSensor(TempSensorApp),
+    Heartbeat(HeartbeatApp),
+    Battery(BatteryApp),
+}
+
+impl App for AnyApp {
+    fn init(&mut self) -> Result<(), AppError> {
+        match self {
+            AnyApp::TempSensor(a) => a.init(),
+            AnyApp::Heartbeat(a) => a.init(),
+            AnyApp::Battery(a) => a.init(),
+        }
+    }
+
+    fn tick(&mut self, bus: &BusHandle) -> Result<(), AppError> {
+        match self {
+            AnyApp::TempSensor(a) => a.tick(bus),
+            AnyApp::Heartbeat(a) => a.tick(bus),
+            AnyApp::Battery(a) => a.tick(bus),
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), AppError> {
+        match self {
+            AnyApp::TempSensor(a) => a.shutdown(),
+            AnyApp::Heartbeat(a) => a.shutdown(),
+            AnyApp::Battery(a) => a.shutdown(),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            AnyApp::TempSensor(a) => a.name(),
+            AnyApp::Heartbeat(a) => a.name(),
+            AnyApp::Battery(a) => a.name(),
+        }
+    }
+}
