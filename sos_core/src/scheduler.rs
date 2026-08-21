@@ -52,6 +52,13 @@ impl<F: FnMut(&BusMessage)> Scheduler<F> {
             }
 
             for msg in self.bus.drain() {
+                if let BusMessage::Command { name, args } = &msg {
+                    for app in self.apps.iter_mut() {
+                        if let Err(e) = app.handle_command(name.as_str(), args.as_slice()) {
+                            report_fault(&bus_handle, app.name(), &e);
+                        }
+                    }
+                }
                 (self.sink)(&msg);
             }
 

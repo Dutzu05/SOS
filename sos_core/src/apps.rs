@@ -93,6 +93,14 @@ impl BatteryApp {
         })
     }
 
+    fn handle_command(&mut self, name: &str, _args: &[Name]) -> Result<(), AppError> {
+        if name == "reset-battery" {
+            self.charge_level = 100.0;
+            self.faulted = false;
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &'static str {
         "battery_app"
     }
@@ -138,6 +146,14 @@ impl App for AnyApp {
             AnyApp::TempSensor(a) => a.name(),
             AnyApp::Heartbeat(a) => a.name(),
             AnyApp::Battery(a) => a.name(),
+        }
+    }
+
+    fn handle_command(&mut self, name: &str, args: &[Name]) -> Result<(), AppError> {
+        match self {
+            AnyApp::TempSensor(a) => a.handle_command(name, args),
+            AnyApp::Heartbeat(a) => a.handle_command(name, args),
+            AnyApp::Battery(a) => a.handle_command(name, args),
         }
     }
 }
