@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use embedded_hal::delay::DelayNs;
+use heapless::Vec as HVec;
 
 use sos_core::apps::{AnyApp, BatteryApp, HeartbeatApp, TempSensorApp};
-use sos_core::{BusMessage, Scheduler};
+use sos_core::{BusMessage, Name, Scheduler, MAX_ARGS, NAME_CAP};
 
 #[derive(Parser)]
 #[command(name = "sos", version, about = "Space Operating System control CLI")]
@@ -19,7 +20,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Acts as the satellite: runs the scheduler and serves telemetry/commands over TCP.
     RunSim {
         #[arg(short, long, default_value_t = 100_000)]
         ticks: u32,
@@ -30,20 +30,10 @@ enum Command {
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
-
-    /// Acts as ground control: connects to a running satellite.
     GroundControl {
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
     },
-}
-
-struct HostDelay;
-
-impl DelayNs for HostDelay {
-    fn delay_ns(&mut self, ns: u32) {
-        thread::sleep(Duration::from_nanos(ns as u64));
-    }
 }
 
 fn main() {
@@ -54,24 +44,68 @@ fn main() {
     }
 }
 
+/// Turns `std::thread::sleep` into the `DelayNs` interface `Scheduler::run`
+/// expects. On real ESP32 hardware, this gets swapped for a HAL timer —
+/// `sos_core` itself never changes.
+struct HostDelay;
+
+impl DelayNs for HostDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        thread::sleep(Duration::from_nanos(ns as u64));
+    }
+}
+
+/// What `sos_core`'s old `log_message` used to do — living here now
+/// because "print to a terminal" is a host capability, not something the
+/// portable core should assume.
+fn log_to_console(msg: &BusMessage) {
+    match msg {
+        BusMessage::Telemetry { sensor_id, value } => {
+            println!("[bus] telemetry sensor={sensor_id} value={value:.2}");
+        }
+        BusMessage::Heartbeat { app_name } => {
+            println!("[bus] heartbeat from {app_name}");
+        }
+        BusMessage::Log { source, text } => {
+            println!("[bus] log [{source}] {text}");
+        }
+        BusMessage::Command { name, args } => {
+            println!("[bus] command received: {name} {args:?}");
+        }
+    }
+}
+
 fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
-    let mut scheduler = Scheduler::new();
+    let listener = TcpListener::bind(addr).expect("failed to bind TCP listener");
+    println!("[sim] listening on {addr}, waiting for ground control...");
+
+    let client_writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+
+    // The sink is needed at construction time now, so it's built before
+    // the scheduler exists rather than bolted on afterward.
+    let sink_writer = Arc::clone(&client_writer);
+    let mut scheduler = Scheduler::new(move |msg: &BusMessage| {
+        log_to_console(msg);
+        let mut guard = sink_writer.lock().unwrap();
+        if let Some(stream) = guard.as_mut() {
+            match msg.to_frame() {
+                Ok(frame) => {
+                    if let Err(e) = stream.write_all(&frame) {
+                        eprintln!("[sim] failed to send telemetry, dropping client: {e}");
+                        *guard = None;
+                    }
+                }
+                Err(e) => eprintln!("[sim] failed to serialize message: {e}"),
+            }
+        }
+    });
+
     scheduler.register(AnyApp::TempSensor(TempSensorApp::new(1)));
     scheduler.register(AnyApp::Heartbeat(HeartbeatApp));
     scheduler.register(AnyApp::Battery(BatteryApp::new(2)));
 
-    // Grab a handle before `run()` takes ownership of the scheduler.
     let bus_handle = scheduler.bus_handle();
 
-    let listener = TcpListener::bind(addr).expect("failed to bind TCP listener");
-    println!("[sim] listening on {addr}, waiting for ground control...");
-
-    // Holds the current ground-station connection's write half.
-    // `None` until someone connects; the sink checks it every tick.
-    let client_writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
-
-    // Accept connections in the background so run-sim doesn't block
-    // startup waiting for a ground station to show up.
     {
         let client_writer = Arc::clone(&client_writer);
         thread::spawn(move || {
@@ -89,19 +123,17 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
                 *client_writer.lock().unwrap() = Some(stream);
 
                 let bus_handle = bus_handle.clone();
-                // One reader thread per connection: blocks on read_line,
-                // forwarding every uplinked command onto the bus.
                 thread::spawn(move || {
                     let mut reader = BufReader::new(reader_stream);
-                    let mut line = String::new();
+                    let mut frame = Vec::new();
                     loop {
-                        line.clear();
-                        match reader.read_line(&mut line) {
+                        frame.clear();
+                        match reader.read_until(0u8, &mut frame) {
                             Ok(0) => {
                                 println!("[sim] ground control disconnected");
                                 break;
                             }
-                            Ok(_) => match BusMessage::from_line(&line) {
+                            Ok(_) => match BusMessage::from_frame(&mut frame) {
                                 Ok(msg) => {
                                     if let Err(e) = bus_handle.send(msg) {
                                         eprintln!("[sim] failed to route command onto bus: {e}");
@@ -120,23 +152,6 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
         });
     }
 
-    // Forward every bus message out to whichever ground station is
-    // currently connected, one JSON line per message.
-    scheduler.set_sink(move |msg| {
-        let mut guard = client_writer.lock().unwrap();
-        if let Some(stream) = guard.as_mut() {
-            match msg.to_line() {
-                Ok(line) => {
-                    if let Err(e) = stream.write_all(line.as_bytes()) {
-                        eprintln!("[sim] failed to send telemetry, dropping client: {e}");
-                        *guard = None;
-                    }
-                }
-                Err(e) => eprintln!("[sim] failed to serialize message: {e}"),
-            }
-        }
-    });
-
     println!("[sim] running {ticks} ticks at {interval_ms}ms interval");
     let mut delay = HostDelay;
     scheduler.run(ticks, interval_ms as u32, &mut delay);
@@ -149,15 +164,15 @@ fn ground_control(addr: &str) {
     let reader_stream = stream.try_clone().expect("failed to clone stream");
     thread::spawn(move || {
         let mut reader = BufReader::new(reader_stream);
-        let mut line = String::new();
+        let mut frame = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            frame.clear();
+            match reader.read_until(0u8, &mut frame) {
                 Ok(0) => {
                     println!("[ground] satellite disconnected");
                     std::process::exit(0);
                 }
-                Ok(_) => match BusMessage::from_line(&line) {
+                Ok(_) => match BusMessage::from_frame(&mut frame) {
                     Ok(msg) => println!("[ground] <- {msg:?}"),
                     Err(e) => eprintln!("[ground] bad message from satellite: {e}"),
                 },
@@ -182,9 +197,6 @@ fn ground_control(addr: &str) {
         if line.trim().is_empty() {
             continue;
         }
-        use sos_core::{Name, MAX_ARGS, NAME_CAP};
-        // (add this near the other `use` lines at the top of the file)
-
         let mut parts = line.split_whitespace();
 
         let raw_name = parts.next().unwrap_or_default();
@@ -196,7 +208,7 @@ fn ground_control(addr: &str) {
             }
         };
 
-        let mut args: heapless::Vec<Name, MAX_ARGS> = heapless::Vec::new();
+        let mut args: HVec<Name, MAX_ARGS> = HVec::new();
         for arg in parts {
             match Name::try_from(arg) {
                 Ok(a) => {
@@ -209,9 +221,9 @@ fn ground_control(addr: &str) {
             }
         }
 
-        match (BusMessage::Command { name, args }).to_line() {
-            Ok(out) => {
-                if let Err(e) = writer.write_all(out.as_bytes()) {
+        match (BusMessage::Command { name, args }).to_frame() {
+            Ok(frame) => {
+                if let Err(e) = writer.write_all(&frame) {
                     eprintln!("[ground] failed to send command: {e}");
                     break;
                 }

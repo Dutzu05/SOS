@@ -4,19 +4,15 @@ use critical_section::Mutex;
 use heapless::{Deque, String as HString, Vec as HVec};
 use serde::{Deserialize, Serialize};
 
-use crate::error::AppError;
+use crate::error::{fmt_text, AppError};
 
-/// Max length for short identifiers: app names, command names, log sources.
 pub const NAME_CAP: usize = 16;
-/// Max length for a log message body.
 pub const TEXT_CAP: usize = 64;
-/// Max number of arguments a single command can carry.
 pub const MAX_ARGS: usize = 4;
-/// How many messages the bus can hold between drains. Sending onto a full
-/// bus now returns an `Err` instead of silently succeeding — the old
-/// `mpsc::channel()` was unbounded and could never say "no", which isn't
-/// realistic for a device with finite memory.
 pub const BUS_CAP: usize = 32;
+/// Max bytes of one COBS-framed, postcard-encoded message on the wire —
+/// comfortable headroom over our worst case (a full Command, ~90 bytes).
+pub const FRAME_CAP: usize = 128;
 
 pub type Name = HString<NAME_CAP>;
 pub type Text = HString<TEXT_CAP>;
@@ -29,24 +25,22 @@ pub enum BusMessage {
     Command { name: Name, args: HVec<Name, MAX_ARGS> },
 }
 
-impl BusMessage { //Serialize into a sg line of JSON and ready to write into a single line TCP
-    pub fn to_line(&self) -> Result<String, AppError> {
-        let mut json =
-            serde_json::to_string(self).map_err(|e| AppError::Serialization(e.to_string()))?;
-        json.push('\n');
-        Ok(json)
+impl BusMessage {
+    /// Serialize + COBS-frame this message into a fixed-capacity buffer,
+    /// ready to write straight onto a TCP stream, a UART, or a radio.
+    pub fn to_frame(&self) -> Result<HVec<u8, FRAME_CAP>, AppError> {
+        postcard::to_vec_cobs::<Self, FRAME_CAP>(self).map_err(|e| AppError::Serialization(fmt_text(e)))
     }
 
-    //Parse a line produce by to line into BusMessage
-
-    pub fn from_line(line: &str) -> Result<Self, AppError> {
-        serde_json::from_str(line.trim()).map_err(|e| AppError::Serialization(e.to_string()))
+    /// Parse one COBS-framed message out of `buf`. `buf` must hold exactly
+    /// one frame, terminating 0x00 included — the caller finds that
+    /// boundary (the CLI does this with `read_until(0, ..)`).
+    pub fn from_frame(buf: &mut [u8]) -> Result<Self, AppError> {
+        postcard::from_bytes_cobs(buf).map_err(|e| AppError::Serialization(fmt_text(e)))
     }
 }
 
-/// The one message queue for the whole program. There's exactly one bus,
-/// same as there's exactly one Scheduler — this `static` is what makes it
-/// reachable from apps and network threads without anyone owning it.
+/// The one message queue for the whole program.
 static QUEUE: Mutex<RefCell<Deque<BusMessage, BUS_CAP>>> =
     Mutex::new(RefCell::new(Deque::new()));
 
@@ -60,12 +54,13 @@ impl BusHandle {
                 .borrow(cs)
                 .borrow_mut()
                 .push_back(message)
-                .map_err(|_| AppError::SendFailed("bus is full".into()))
+                .map_err(|_| AppError::SendFailed(Text::try_from("bus is full").unwrap()))
         })
     }
 }
 
 pub struct Bus;
+
 impl Bus {
     pub fn new() -> Self {
         Bus
@@ -80,7 +75,7 @@ impl Bus {
             let mut queue = QUEUE.borrow(cs).borrow_mut();
             let mut out = HVec::new();
             while let Some(msg) = queue.pop_front() {
-                let _ = out.push(msg); // can't fail: out's capacity == queue's
+                let _ = out.push(msg);
             }
             out
         })
