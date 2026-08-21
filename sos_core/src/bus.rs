@@ -1,6 +1,8 @@
-use heapless::{String as HString, Vec as HVec};
+use core::cell::RefCell;
+
+use critical_section::Mutex;
+use heapless::{Deque, String as HString, Vec as HVec};
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc;
 
 use crate::error::AppError;
 
@@ -10,6 +12,11 @@ pub const NAME_CAP: usize = 16;
 pub const TEXT_CAP: usize = 64;
 /// Max number of arguments a single command can carry.
 pub const MAX_ARGS: usize = 4;
+/// How many messages the bus can hold between drains. Sending onto a full
+/// bus now returns an `Err` instead of silently succeeding — the old
+/// `mpsc::channel()` was unbounded and could never say "no", which isn't
+/// realistic for a device with finite memory.
+pub const BUS_CAP: usize = 32;
 
 pub type Name = HString<NAME_CAP>;
 pub type Text = HString<TEXT_CAP>;
@@ -37,39 +44,46 @@ impl BusMessage { //Serialize into a sg line of JSON and ready to write into a s
     }
 }
 
-#[derive(Clone)]
-pub struct BusHandle {
-    tx: mpsc::Sender<BusMessage>,
-}
+/// The one message queue for the whole program. There's exactly one bus,
+/// same as there's exactly one Scheduler — this `static` is what makes it
+/// reachable from apps and network threads without anyone owning it.
+static QUEUE: Mutex<RefCell<Deque<BusMessage, BUS_CAP>>> =
+    Mutex::new(RefCell::new(Deque::new()));
+
+#[derive(Clone, Copy)]
+pub struct BusHandle;
 
 impl BusHandle {
     pub fn send(&self, message: BusMessage) -> Result<(), AppError> {
-        self.tx
-            .send(message)
-            .map_err(|e| AppError::SendFailed(e.to_string()))
+        critical_section::with(|cs| {
+            QUEUE
+                .borrow(cs)
+                .borrow_mut()
+                .push_back(message)
+                .map_err(|_| AppError::SendFailed("bus is full".into()))
+        })
     }
 }
 
-pub struct Bus {
-    tx: mpsc::Sender<BusMessage>,
-    rx: mpsc::Receiver<BusMessage>,
-}
-
+pub struct Bus;
 impl Bus {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
-        Bus { tx, rx }
+        Bus
     }
 
     pub fn handle(&self) -> BusHandle {
-        BusHandle { tx: self.tx.clone() }
+        BusHandle
     }
-    pub fn drain(&self) ->Vec<BusMessage> {
-        let mut out = Vec::new();
-        while let Ok(message) = self.rx.try_recv() {
-            out.push(message);
-        }
-        out
+
+    pub fn drain(&self) -> HVec<BusMessage, BUS_CAP> {
+        critical_section::with(|cs| {
+            let mut queue = QUEUE.borrow(cs).borrow_mut();
+            let mut out = HVec::new();
+            while let Some(msg) = queue.pop_front() {
+                let _ = out.push(msg); // can't fail: out's capacity == queue's
+            }
+            out
+        })
     }
 }
 
