@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::bus::{BusHandle, BusMessage};
+use crate::bus::{BusHandle, BusMessage, Name};
 use crate::error::AppError;
 
 pub struct TempSensorApp {
@@ -41,7 +41,7 @@ pub struct HeartbeatApp;
 impl App for HeartbeatApp {
     fn tick(&mut self, bus: &BusHandle) -> Result<(), AppError> {
         bus.send(BusMessage::Heartbeat {
-            app_name: "heartbeat".to_string(),
+            app_name: Name::try_from("heartbeat").unwrap(),
         })
     }
 

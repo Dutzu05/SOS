@@ -10,3 +10,4 @@ path = "src/main.rs"
 [dependencies]
 sos-core = { path = "../sos_core" }
 clap = { version = "4", features = ["derive"] }
+heapless = "0.9"

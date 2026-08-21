@@ -172,9 +172,32 @@ fn ground_control(addr: &str) {
         if line.trim().is_empty() {
             continue;
         }
+        use sos_core::{Name, MAX_ARGS, NAME_CAP};
+        // (add this near the other `use` lines at the top of the file)
+
         let mut parts = line.split_whitespace();
-        let name = parts.next().unwrap_or_default().to_string();
-        let args: Vec<String> = parts.map(str::to_string).collect();
+
+        let raw_name = parts.next().unwrap_or_default();
+        let name = match Name::try_from(raw_name) {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("[ground] command name '{raw_name}' is too long (max {NAME_CAP} chars), ignoring");
+                continue;
+            }
+        };
+
+        let mut args: heapless::Vec<Name, MAX_ARGS> = heapless::Vec::new();
+        for arg in parts {
+            match Name::try_from(arg) {
+                Ok(a) => {
+                    if args.push(a).is_err() {
+                        eprintln!("[ground] too many arguments (max {MAX_ARGS}), dropping the rest");
+                        break;
+                    }
+                }
+                Err(_) => eprintln!("[ground] argument '{arg}' is too long (max {NAME_CAP} chars), skipping"),
+            }
+        }
 
         match (BusMessage::Command { name, args }).to_line() {
             Ok(out) => {

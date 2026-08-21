@@ -1,20 +1,24 @@
-use thiserror::Error;
+use core::fmt;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum AppError {
-    #[error("init failed: {0}")]
     InitFailed(String),
-
-    #[error("failed to send message on bus: {0}")]
     SendFailed(String),
-
-    #[error("sensor {0} reported a fault")]
     SensorFault(u8),
-
-    #[error("shutdown did not complete cleanly: {0}")]
     ShutdownFailed(String),
-
-    #[error("(de)serialization error: {0}")]
     Serialization(String),
 }
 
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppError::InitFailed(msg) => write!(f, "init failed: {msg}"),
+            AppError::SendFailed(msg) => write!(f, "failed to send message on bus: {msg}"),
+            AppError::SensorFault(id) => write!(f, "sensor {id} reported a fault"),
+            AppError::ShutdownFailed(msg) => write!(f, "shutdown did not complete cleanly: {msg}"),
+            AppError::Serialization(msg) => write!(f, "(de)serialization error: {msg}"),
+        }
+    }
+}
+
+impl core::error::Error for AppError {}

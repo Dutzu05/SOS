@@ -1,14 +1,25 @@
-use std::sync::mpsc;
+use heapless::{String as HString, Vec as HVec};
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc;
 
 use crate::error::AppError;
+
+/// Max length for short identifiers: app names, command names, log sources.
+pub const NAME_CAP: usize = 16;
+/// Max length for a log message body.
+pub const TEXT_CAP: usize = 64;
+/// Max number of arguments a single command can carry.
+pub const MAX_ARGS: usize = 4;
+
+pub type Name = HString<NAME_CAP>;
+pub type Text = HString<TEXT_CAP>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BusMessage {
     Telemetry { sensor_id: u8, value: f32 },
-    Heartbeat { app_name: String },
-    Log { source: String, text: String },
-    Command { name: String, args: Vec<String> },
+    Heartbeat { app_name: Name },
+    Log { source: Name, text: Text },
+    Command { name: Name, args: HVec<Name, MAX_ARGS> },
 }
 
 impl BusMessage { //Serialize into a sg line of JSON and ready to write into a single line TCP
