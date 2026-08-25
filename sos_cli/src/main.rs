@@ -9,7 +9,7 @@ use embedded_hal::delay::DelayNs;
 use heapless::Vec as HVec;
 
 use sos_core::apps::{AnyApp, BatteryApp, HeartbeatApp, TempSensorApp};
-use sos_core::{BusMessage, Name, Scheduler, MAX_ARGS, NAME_CAP};
+use sos_core::{BusMessage, Name, Scheduler, WireMessage, MAX_ARGS, NAME_CAP};
 
 #[derive(Parser)]
 #[command(name = "sos", version, about = "Space Operating System control CLI")]
@@ -84,11 +84,16 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
     // The sink is needed at construction time now, so it's built before
     // the scheduler exists rather than bolted on afterward.
     let sink_writer = Arc::clone(&client_writer);
+    let mut downlink_seq: u32 = 0;
     let mut scheduler = Scheduler::new(move |msg: &BusMessage| {
         log_to_console(msg);
+
+        downlink_seq = downlink_seq.wrapping_add(1);
+        let wire = WireMessage::Bus { seq: downlink_seq, msg: msg.clone() };
+
         let mut guard = sink_writer.lock().unwrap();
         if let Some(stream) = guard.as_mut() {
-            match msg.to_frame() {
+            match wire.to_frame() {
                 Ok(frame) => {
                     if let Err(e) = stream.write_all(&frame) {
                         eprintln!("[sim] failed to send telemetry, dropping client: {e}");
@@ -208,6 +213,7 @@ fn ground_control(addr: &str) {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader_stream);
         let mut frame = Vec::new();
+        let mut last_seq: Option<u32> = None;
         loop {
             frame.clear();
             match reader.read_until(0u8, &mut frame) {
@@ -215,8 +221,18 @@ fn ground_control(addr: &str) {
                     println!("[ground] satellite disconnected");
                     std::process::exit(0);
                 }
-                Ok(_) => match BusMessage::from_frame(&mut frame) {
-                    Ok(msg) => println!("[ground] <- {msg:?}"),
+                Ok(_) => match WireMessage::from_frame(&mut frame) {
+                    Ok(WireMessage::Bus { seq, msg }) => {
+                        if let Some(last) = last_seq {
+                            let expected = last.wrapping_add(1);
+                            if seq != expected {
+                                println!("[ground] !! sequence gap: expected {expected}, got {seq}");
+                            }
+                        }
+                        last_seq = Some(seq);
+                        println!("[ground] <- #{seq} {msg:?}");
+                    }
+                    Ok(other) => println!("[ground] <- {other:?}"),
                     Err(e) => eprintln!("[ground] bad message from satellite: {e}"),
                 },
                 Err(e) => {
