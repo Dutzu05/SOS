@@ -55,6 +55,21 @@ impl DelayNs for HostDelay {
     }
 }
 
+fn send_wire(client_writer: &Arc<Mutex<Option<TcpStream>>>, wire: &WireMessage) {
+    let mut guard = client_writer.lock().unwrap();
+    if let Some(stream) = guard.as_mut() {
+        match wire.to_frame() {
+            Ok(frame) => {
+                if let Err(e) = stream.write_all(&frame) {
+                    eprintln!("[sim] failed to send, dropping client: {e}");
+                    *guard = None;
+                }
+            }
+            Err(e) => eprintln!("[sim] failed to serialize message: {e}"),
+        }
+    }
+}
+
 /// What `sos_core`'s old `log_message` used to do — living here now
 /// because "print to a terminal" is a host capability, not something the
 /// portable core should assume.
@@ -87,22 +102,8 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
     let mut downlink_seq: u32 = 0;
     let mut scheduler = Scheduler::new(move |msg: &BusMessage| {
         log_to_console(msg);
-
         downlink_seq = downlink_seq.wrapping_add(1);
-        let wire = WireMessage::Bus { seq: downlink_seq, msg: msg.clone() };
-
-        let mut guard = sink_writer.lock().unwrap();
-        if let Some(stream) = guard.as_mut() {
-            match wire.to_frame() {
-                Ok(frame) => {
-                    if let Err(e) = stream.write_all(&frame) {
-                        eprintln!("[sim] failed to send telemetry, dropping client: {e}");
-                        *guard = None;
-                    }
-                }
-                Err(e) => eprintln!("[sim] failed to serialize message: {e}"),
-            }
-        }
+        send_wire(&sink_writer, &WireMessage::Bus { seq: downlink_seq, msg: msg.clone() });
     });
 
     scheduler.register(AnyApp::TempSensor(TempSensorApp::new(1)));
@@ -163,6 +164,7 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
                     }
 
                     *client_writer.lock().unwrap() = Some(stream);
+                    let mut last_uplink_seq: Option<u32> = None;
 
                     loop {
                         frame.clear();
@@ -171,12 +173,24 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
                                 println!("[sim] ground control disconnected");
                                 break;
                             }
-                            Ok(_) => match BusMessage::from_frame(&mut frame) {
-                                Ok(msg) => {
-                                    if let Err(e) = bus_handle.send(msg) {
-                                        eprintln!("[sim] failed to route command onto bus: {e}");
+                            Ok(_) => match WireMessage::from_frame(&mut frame) {
+                                Ok(WireMessage::Bus { seq, msg }) => {
+                                    let is_stale = last_uplink_seq.is_some_and(|last| seq <= last);
+                                    if is_stale {
+                                        eprintln!("[sim] rejecting seq {seq}: stale or replayed");
+                                        send_wire(&client_writer, &WireMessage::Nack {
+                                            seq,
+                                            reason: sos_core::NackReason::StaleOrReplayedSeq,
+                                        });
+                                    } else {
+                                        last_uplink_seq = Some(seq);
+                                        if let Err(e) = bus_handle.send(msg) {
+                                            eprintln!("[sim] failed to route command onto bus: {e}");
+                                        }
+                                        send_wire(&client_writer, &WireMessage::Ack { seq });
                                     }
                                 }
+                                Ok(other) => eprintln!("[sim] unexpected message from ground control: {other:?}"),
                                 Err(e) => eprintln!("[sim] bad message from ground control: {e}"),
                             },
                             Err(e) => {
@@ -232,7 +246,11 @@ fn ground_control(addr: &str) {
                         last_seq = Some(seq);
                         println!("[ground] <- #{seq} {msg:?}");
                     }
-                    Ok(other) => println!("[ground] <- {other:?}"),
+                    Ok(WireMessage::Ack { seq }) => println!("[ground] <- ACK #{seq}"),
+                    Ok(WireMessage::Nack { seq, reason }) => println!("[ground] <- NACK #{seq}: {reason:?}"),
+                    Ok(WireMessage::CommandResult { seq, outcome }) => {
+                        println!("[ground] <- result #{seq}: {outcome:?}")
+                    }
                     Err(e) => eprintln!("[ground] bad message from satellite: {e}"),
                 },
                 Err(e) => {
@@ -245,6 +263,7 @@ fn ground_control(addr: &str) {
 
     println!("[ground] type a command (e.g. `reset-battery`) and press enter:");
     let mut writer = stream;
+    let mut uplink_seq: u32 = 0;
     for line in std::io::stdin().lines() {
         let line = match line {
             Ok(l) => l,
@@ -280,7 +299,12 @@ fn ground_control(addr: &str) {
             }
         }
 
-        match (BusMessage::Command { name, args }).to_frame() {
+        uplink_seq = uplink_seq.wrapping_add(1);
+        let wire = WireMessage::Bus {
+            seq: uplink_seq,
+            msg: BusMessage::Command { name, args },
+        };
+        match wire.to_frame() {
             Ok(frame) => {
                 if let Err(e) = writer.write_all(&frame) {
                     eprintln!("[ground] failed to send command: {e}");
