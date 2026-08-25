@@ -8,7 +8,7 @@ name = "sos"
 path = "src/main.rs"
 
 [dependencies]
-sos-core = { path = "../sos_core" }
+sos-core = { path = "../sos_core", features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 heapless = "0.7"
 embedded-hal = "1"

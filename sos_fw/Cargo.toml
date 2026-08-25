@@ -1,0 +1,15 @@
+[package]
+name = "sos-fw"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sos_fw"
+path = "src/main.rs"
+
+[dependencies]
+sos-core = { path = "../sos_core" }
+esp-hal = { version = "1.0.0-beta.0", features = ["esp32c3", "unstable"] }
+
+[profile.release]
+opt-level = "s"
