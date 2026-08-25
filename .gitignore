@@ -1,1 +1,7 @@
 /target
+
+# Shared ground-station/satellite auth secret, baked in at compile time via
+# include_bytes! in sos_core/src/auth.rs. Never commit the real key —
+# generate your own locally (see secrets/README.md).
+/secrets/*
+!/secrets/README.md

@@ -120,12 +120,45 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
                 println!("[sim] ground control connected: {:?}", stream.peer_addr());
 
                 let reader_stream = stream.try_clone().expect("failed to clone stream");
-                *client_writer.lock().unwrap() = Some(stream);
 
                 let bus_handle = bus_handle.clone();
+                let client_writer = Arc::clone(&client_writer);
                 thread::spawn(move || {
                     let mut reader = BufReader::new(reader_stream);
                     let mut frame = Vec::new();
+
+                    // First frame on a fresh connection must be the shared-secret
+                    // auth token — nothing else is accepted until it checks out.
+                    // Only wire this connection up as the telemetry/log sink
+                    // (`client_writer`) after it authenticates, so a failed
+                    // attempt never becomes the thing bus messages get written to.
+                    match reader.read_until(0u8, &mut frame) {
+                        Ok(0) => {
+                            println!("[sim] ground control disconnected before authenticating");
+                            return;
+                        }
+                        Ok(_) => match sos_core::AuthToken::from_frame(&mut frame) {
+                            Ok(token) if sos_core::verify(&token.0) => {
+                                println!("[sim] ground control authenticated");
+                            }
+                            _ => {
+                                let _ = bus_handle.send(BusMessage::Log {
+                                    source: Name::try_from("auth").unwrap(),
+                                    text: sos_core::Text::try_from("rejected connection: bad auth token").unwrap(),
+                                });
+                                // Silent drop — no response sent to the caller, since
+                                // telling an attacker "wrong secret" is itself a leak.
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            eprintln!("[sim] read error while awaiting auth: {e}");
+                            return;
+                        }
+                    }
+
+                    *client_writer.lock().unwrap() = Some(stream);
+
                     loop {
                         frame.clear();
                         match reader.read_until(0u8, &mut frame) {
@@ -158,8 +191,18 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
 }
 
 fn ground_control(addr: &str) {
-    let stream = TcpStream::connect(addr).expect("failed to connect to satellite");
+    // 1. Notice 'mut' is added here so we can write to it!
+    let mut stream = TcpStream::connect(addr).expect("failed to connect to satellite");
     println!("[ground] connected to {addr}");
+
+    // 2. Send the AuthToken as the very first action
+    let frame = sos_core::AuthToken(sos_core::SHARED_SECRET)
+        .to_frame()
+        .expect("failed to serialize auth token");
+    std::io::Write::write_all(&mut stream, &frame).expect("failed to send auth token");
+    println!("[ground] auth token sent");
+
+    // 3. NOW it is safe to clone the stream and start the listening thread
 
     let reader_stream = stream.try_clone().expect("failed to clone stream");
     thread::spawn(move || {
