@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/sos_cli/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/sos_core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/sos_core/fuzz/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
