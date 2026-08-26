@@ -5,23 +5,26 @@ use heapless::Vec as HVec;
 
 use crate::app::App;
 use crate::apps::AnyApp;
-use crate::bus::{Bus, BusHandle, BusMessage, Name};
+use crate::bus::{Bus, BusHandle, BusMessage, Name, Text};
 use crate::error::fmt_text;
+use crate::protocol::CommandOutcome;
 
 pub const MAX_APPS: usize = 8;
 
-pub struct Scheduler<F: FnMut(&BusMessage)> {
+pub struct Scheduler<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> {
     bus: Bus,
     apps: HVec<AnyApp, MAX_APPS>,
     sink: F,
+    command_result_sink: G,
 }
 
-impl<F: FnMut(&BusMessage)> Scheduler<F> {
-    pub fn new(sink: F) -> Self {
+impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
+    pub fn new(sink: F, command_result_sink: G) -> Self {
         Scheduler {
             bus: Bus::new(),
             apps: HVec::new(),
             sink,
+            command_result_sink,
         }
     }
 
@@ -53,11 +56,22 @@ impl<F: FnMut(&BusMessage)> Scheduler<F> {
 
             for msg in self.bus.drain() {
                 if let BusMessage::Command { name, args } = &msg {
+                    // The satellite shouts commands to every app at once, so
+                    // the command as a whole only succeeds if every app that
+                    // recognizes it does — one failing app fails the result.
+                    let mut failed = false;
                     for app in self.apps.iter_mut() {
                         if let Err(e) = app.handle_command(name.as_str(), args.as_slice()) {
                             report_fault(&bus_handle, app.name(), &e);
+                            failed = true;
                         }
                     }
+                    let outcome = if failed {
+                        CommandOutcome::Failed(Text::try_from("one or more apps rejected the command").unwrap_or_default())
+                    } else {
+                        CommandOutcome::Success
+                    };
+                    (self.command_result_sink)(&outcome);
                 }
                 (self.sink)(&msg);
             }
@@ -73,13 +87,14 @@ impl<F: FnMut(&BusMessage)> Scheduler<F> {
     }
 }
 
-impl Scheduler<fn(&BusMessage)> {
-    /// A scheduler with no telemetry sink. Bus traffic (including the
-    /// fault `Log` messages below) still happens, it just isn't forwarded
-    /// anywhere outside the process.
+impl Scheduler<fn(&BusMessage), fn(&CommandOutcome)> {
+    /// A scheduler with no telemetry or command-result sink. Bus traffic
+    /// (including the fault `Log` messages below) still happens, it just
+    /// isn't forwarded anywhere outside the process.
     pub fn without_sink() -> Self {
-        fn no_op(_msg: &BusMessage) {}
-        Self::new(no_op)
+        fn no_op_bus(_msg: &BusMessage) {}
+        fn no_op_result(_outcome: &CommandOutcome) {}
+        Self::new(no_op_bus, no_op_result)
     }
 }
 

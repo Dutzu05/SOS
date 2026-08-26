@@ -30,6 +30,7 @@ pub enum NackReason {
     UnknownCommand,
     StaleOrReplayedSeq,
     AppFault,
+    BusFull,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

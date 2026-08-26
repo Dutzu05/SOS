@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,7 @@ use embedded_hal::delay::DelayNs;
 use heapless::Vec as HVec;
 
 use sos_core::apps::{AnyApp, BatteryApp, HeartbeatApp, TempSensorApp};
-use sos_core::{BusMessage, Name, Scheduler, WireMessage, MAX_ARGS, NAME_CAP};
+use sos_core::{BusMessage, CommandOutcome, Name, Scheduler, WireMessage, MAX_ARGS, NAME_CAP};
 
 #[derive(Parser)]
 #[command(name = "sos", version, about = "Space Operating System control CLI")]
@@ -96,15 +97,33 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
 
     let client_writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
 
-    // The sink is needed at construction time now, so it's built before
-    // the scheduler exists rather than bolted on afterward.
+    // Sequence numbers are a wire-layer concept `sos_core` never sees (see
+    // `protocol.rs`), so the pairing between an inbound command and its
+    // eventual result lives here, not in the `Scheduler`. The network
+    // thread pushes a `seq` here only once its `Command` is successfully
+    // enqueued on the bus; the scheduler emits outcomes in the same FIFO
+    // order it received the commands, so popping the front always matches.
+    let pending_command_seqs: Arc<Mutex<VecDeque<u32>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+    // The sinks are needed at construction time now, so they're built
+    // before the scheduler exists rather than bolted on afterward.
     let sink_writer = Arc::clone(&client_writer);
     let mut downlink_seq: u32 = 0;
-    let mut scheduler = Scheduler::new(move |msg: &BusMessage| {
-        log_to_console(msg);
-        downlink_seq = downlink_seq.wrapping_add(1);
-        send_wire(&sink_writer, &WireMessage::Bus { seq: downlink_seq, msg: msg.clone() });
-    });
+    let result_writer = Arc::clone(&client_writer);
+    let result_seqs = Arc::clone(&pending_command_seqs);
+    let mut scheduler = Scheduler::new(
+        move |msg: &BusMessage| {
+            log_to_console(msg);
+            downlink_seq = downlink_seq.wrapping_add(1);
+            send_wire(&sink_writer, &WireMessage::Bus { seq: downlink_seq, msg: msg.clone() });
+        },
+        move |outcome: &CommandOutcome| {
+            match result_seqs.lock().unwrap().pop_front() {
+                Some(seq) => send_wire(&result_writer, &WireMessage::CommandResult { seq, outcome: outcome.clone() }),
+                None => eprintln!("[sim] got a command outcome with no pending seq to pair it with"),
+            }
+        },
+    );
 
     scheduler.register(AnyApp::TempSensor(TempSensorApp::new(1)));
     scheduler.register(AnyApp::Heartbeat(HeartbeatApp));
@@ -129,6 +148,7 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
 
                 let bus_handle = bus_handle.clone();
                 let client_writer = Arc::clone(&client_writer);
+                let pending_command_seqs = Arc::clone(&pending_command_seqs);
                 thread::spawn(move || {
                     let mut reader = BufReader::new(reader_stream);
                     let mut frame = Vec::new();
@@ -183,11 +203,29 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
                                             reason: sos_core::NackReason::StaleOrReplayedSeq,
                                         });
                                     } else {
-                                        last_uplink_seq = Some(seq);
-                                        if let Err(e) = bus_handle.send(msg) {
-                                            eprintln!("[sim] failed to route command onto bus: {e}");
+                                        let is_command = matches!(msg, BusMessage::Command { .. });
+                                        match bus_handle.send(msg) {
+                                            Ok(()) => {
+                                                last_uplink_seq = Some(seq);
+                                                if is_command {
+                                                    pending_command_seqs.lock().unwrap().push_back(seq);
+                                                }
+                                                send_wire(&client_writer, &WireMessage::Ack { seq });
+                                            }
+                                            Err(e) => {
+                                                // Bus is full — a transient failure, not a
+                                                // rejection. Don't advance `last_uplink_seq`
+                                                // so a retransmit of this same `seq` is
+                                                // accepted (not treated as stale/replayed),
+                                                // and don't Ack a command that never actually
+                                                // got enqueued.
+                                                eprintln!("[sim] failed to route command onto bus: {e}");
+                                                send_wire(&client_writer, &WireMessage::Nack {
+                                                    seq,
+                                                    reason: sos_core::NackReason::BusFull,
+                                                });
+                                            }
                                         }
-                                        send_wire(&client_writer, &WireMessage::Ack { seq });
                                     }
                                 }
                                 Ok(other) => eprintln!("[sim] unexpected message from ground control: {other:?}"),
