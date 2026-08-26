@@ -11,11 +11,18 @@ use crate::protocol::CommandOutcome;
 
 pub const MAX_APPS: usize = 8;
 
+/// Consecutive ticks with no `BusMessage::Heartbeat` observed on the bus
+/// before the scheduler raises a fault. Only starts counting after the
+/// first heartbeat is seen — if nothing registered ever sends one, the
+/// watchdog stays silent rather than assuming one was expected.
+const HEARTBEAT_WATCHDOG_TICKS: u32 = 5;
+
 pub struct Scheduler<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> {
     bus: Bus,
     apps: HVec<AnyApp, MAX_APPS>,
     sink: F,
     command_result_sink: G,
+    ticks_since_heartbeat: Option<u32>,
 }
 
 impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
@@ -25,6 +32,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
             apps: HVec::new(),
             sink,
             command_result_sink,
+            ticks_since_heartbeat: None,
         }
     }
 
@@ -54,7 +62,12 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                 }
             }
 
+            let mut heartbeat_seen_this_tick = false;
+
             for msg in self.bus.drain() {
+                if matches!(msg, BusMessage::Heartbeat { .. }) {
+                    heartbeat_seen_this_tick = true;
+                }
                 if let BusMessage::Command { name, args } = &msg {
                     // The satellite shouts commands to every app at once, so
                     // the command as a whole only succeeds if every app that
@@ -74,6 +87,19 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                     (self.command_result_sink)(&outcome);
                 }
                 (self.sink)(&msg);
+            }
+
+            if heartbeat_seen_this_tick {
+                self.ticks_since_heartbeat = Some(0);
+            } else if let Some(missed) = self.ticks_since_heartbeat.as_mut() {
+                *missed += 1;
+                if *missed == HEARTBEAT_WATCHDOG_TICKS {
+                    report_fault(
+                        &bus_handle,
+                        "watchdog",
+                        format_args!("no heartbeat in {HEARTBEAT_WATCHDOG_TICKS} ticks"),
+                    );
+                }
             }
 
             delay.delay_ms(tick_interval_ms);

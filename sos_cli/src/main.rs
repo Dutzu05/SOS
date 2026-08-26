@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use embedded_hal::delay::DelayNs;
@@ -277,6 +277,12 @@ fn resolve_ack(ack_state: &(Mutex<PendingAck>, Condvar), seq: u32, outcome: AckO
     }
 }
 
+/// How long ground control will go without seeing a `Heartbeat` from the
+/// satellite before it flags the link as possibly dead. Generous relative
+/// to `run_sim`'s default 200ms tick — this only needs to catch a genuinely
+/// silent vehicle, not the odd late tick.
+const HEARTBEAT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn ground_control(addr: &str) {
     // 1. Notice 'mut' is added here so we can write to it!
     let mut stream = TcpStream::connect(addr).expect("failed to connect to satellite");
@@ -297,8 +303,35 @@ fn ground_control(addr: &str) {
     let ack_state: Arc<(Mutex<PendingAck>, Condvar)> =
         Arc::new((Mutex::new(PendingAck { seq: 0, outcome: None }), Condvar::new()));
 
+    // Updated by the reader thread on every `Heartbeat`; polled by the
+    // watchdog thread below. Starts at connect time so a satellite that
+    // never sends a first heartbeat is caught too, not just one that stops.
+    let last_heartbeat: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+
+    {
+        let last_heartbeat = Arc::clone(&last_heartbeat);
+        thread::spawn(move || {
+            let mut alarmed = false;
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                let elapsed = last_heartbeat.lock().unwrap().elapsed();
+                if elapsed > HEARTBEAT_WATCHDOG_TIMEOUT && !alarmed {
+                    alarmed = true;
+                    println!(
+                        "[ground] !! WATCHDOG: no heartbeat in {:.1}s — possible loss of vehicle",
+                        elapsed.as_secs_f32()
+                    );
+                } else if elapsed <= HEARTBEAT_WATCHDOG_TIMEOUT && alarmed {
+                    alarmed = false;
+                    println!("[ground] watchdog: heartbeat resumed");
+                }
+            }
+        });
+    }
+
     let reader_stream = stream.try_clone().expect("failed to clone stream");
     let reader_ack_state = Arc::clone(&ack_state);
+    let reader_last_heartbeat = Arc::clone(&last_heartbeat);
     thread::spawn(move || {
         let mut reader = BufReader::new(reader_stream);
         let mut frame = Vec::new();
@@ -319,6 +352,9 @@ fn ground_control(addr: &str) {
                             }
                         }
                         last_seq = Some(seq);
+                        if matches!(msg, BusMessage::Heartbeat { .. }) {
+                            *reader_last_heartbeat.lock().unwrap() = Instant::now();
+                        }
                         println!("[ground] <- #{seq} {msg:?}");
                     }
                     Ok(WireMessage::Ack { seq }) => {
