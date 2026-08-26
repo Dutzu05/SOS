@@ -88,6 +88,16 @@ fn log_to_console(msg: &BusMessage) {
         BusMessage::Command { name, args } => {
             println!("[bus] command received: {name} {args:?}");
         }
+        BusMessage::Housekeeping { apps } => {
+            print!("[bus] housekeeping:");
+            for app in apps {
+                print!(
+                    " [{}: ok={} err={} unhealthy={}]",
+                    app.name, app.cmd_accepted, app.cmd_rejected, app.consecutive_tick_failures
+                );
+            }
+            println!();
+        }
     }
 }
 

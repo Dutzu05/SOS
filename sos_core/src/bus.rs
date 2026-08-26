@@ -10,9 +10,15 @@ pub const NAME_CAP: usize = 16;
 pub const TEXT_CAP: usize = 64;
 pub const MAX_ARGS: usize = 4;
 pub const BUS_CAP: usize = 32;
+/// Ceiling on registered apps, and so on how many `AppHealth` entries a
+/// `Housekeeping` message can carry. Lives here (not `scheduler.rs`, which
+/// re-exports it) because `BusMessage` needs it for `Housekeeping`'s capacity.
+pub const MAX_APPS: usize = 8;
 /// Max bytes of one COBS-framed, postcard-encoded message on the wire —
-/// comfortable headroom over our worst case (a full Command, ~90 bytes).
-pub const FRAME_CAP: usize = 128;
+/// comfortable headroom over our worst case, a fully-populated
+/// `Housekeeping` (`MAX_APPS` entries, ~258 bytes pre-COBS). See
+/// `tests::housekeeping_frame_fits_within_frame_cap`.
+pub const FRAME_CAP: usize = 288;
 
 pub type Name = HString<NAME_CAP>;
 pub type Text = HString<TEXT_CAP>;
@@ -28,12 +34,25 @@ pub enum Severity {
     Critical,
 }
 
+/// One app's slice of a `Housekeeping` packet — the same per-app numbers
+/// the `noop` command and the tick-failure watchdog already track,
+/// snapshotted in one place instead of scattered across separate `Log`
+/// lines. Mirrors cFE HK: small, fixed-shape, cheap to downlink often.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppHealth {
+    pub name: Name,
+    pub cmd_accepted: u32,
+    pub cmd_rejected: u32,
+    pub consecutive_tick_failures: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BusMessage {
     Telemetry { sensor_id: u8, value: f32 },
     Heartbeat { app_name: Name },
     Log { severity: Severity, source: Name, text: Text },
     Command { name: Name, args: HVec<Name, MAX_ARGS> },
+    Housekeeping { apps: HVec<AppHealth, MAX_APPS> },
 }
 
 impl BusMessage {
@@ -124,6 +143,37 @@ mod tests {
         assert!(
             frame.len() <= FRAME_CAP,
             "worst-case Command frame is {} bytes, only {FRAME_CAP} bytes of headroom",
+            frame.len()
+        );
+    }
+
+    /// Pins `FRAME_CAP` against a fully-populated `Housekeeping` (`MAX_APPS`
+    /// entries, each with a max-length name and maxed-out u32 counters) —
+    /// the actual worst-case `BusMessage` now, bigger than `Command`. Fails
+    /// loudly if `MAX_APPS` grows without `FRAME_CAP` growing to match.
+    #[test]
+    fn housekeeping_frame_fits_within_frame_cap() {
+        let max_name = || {
+            let bytes = [b'A'; NAME_CAP];
+            Name::try_from(core::str::from_utf8(&bytes).unwrap()).unwrap()
+        };
+
+        let mut apps: HVec<AppHealth, MAX_APPS> = HVec::new();
+        for _ in 0..MAX_APPS {
+            apps.push(AppHealth {
+                name: max_name(),
+                cmd_accepted: u32::MAX,
+                cmd_rejected: u32::MAX,
+                consecutive_tick_failures: u32::MAX,
+            })
+            .unwrap();
+        }
+        let msg = BusMessage::Housekeeping { apps };
+
+        let frame = msg.to_frame().expect("worst-case Housekeeping must fit in FRAME_CAP");
+        assert!(
+            frame.len() <= FRAME_CAP,
+            "worst-case Housekeeping frame is {} bytes, only {FRAME_CAP} bytes of headroom",
             frame.len()
         );
     }

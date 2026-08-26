@@ -5,11 +5,20 @@ use heapless::Vec as HVec;
 
 use crate::app::App;
 use crate::apps::AnyApp;
-use crate::bus::{Bus, BusHandle, BusMessage, Name, Severity, Text};
+use crate::bus::{AppHealth, Bus, BusHandle, BusMessage, Name, Severity, Text};
 use crate::error::fmt_text;
 use crate::protocol::CommandOutcome;
 
-pub const MAX_APPS: usize = 8;
+// `MAX_APPS` now lives in `bus.rs` (needed there for `Housekeeping`'s
+// capacity); re-exported here so `sos_core::MAX_APPS` doesn't move.
+pub use crate::bus::MAX_APPS;
+
+/// How often (in ticks) the scheduler assembles and sends one aggregate
+/// `Housekeeping` packet, instead of every app's health being visible only
+/// as scattered `Log` lines. Slower than the science-telemetry cadence on
+/// purpose — HK is meant to be cheap to downlink often, cFS runs it at
+/// ~1Hz regardless of how fast individual apps tick.
+const HOUSEKEEPING_INTERVAL_TICKS: u32 = 5;
 
 /// Consecutive `tick()` failures for one app before the scheduler declares
 /// it unhealthy — the cFE Health & Safety analog: did this specific app
@@ -104,6 +113,20 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                         }
                     }
                 }
+            }
+
+            if tick_num % HOUSEKEEPING_INTERVAL_TICKS == 0 {
+                let mut apps_health: HVec<AppHealth, MAX_APPS> = HVec::new();
+                let counters_and_health = self.counters.iter().zip(self.consecutive_tick_failures.iter());
+                for (app, (counters, unhealthy)) in self.apps.iter().zip(counters_and_health) {
+                    let _ = apps_health.push(AppHealth {
+                        name: Name::try_from(app.name()).unwrap_or_default(),
+                        cmd_accepted: counters.accepted,
+                        cmd_rejected: counters.rejected,
+                        consecutive_tick_failures: *unhealthy,
+                    });
+                }
+                let _ = bus_handle.send(BusMessage::Housekeeping { apps: apps_health });
             }
 
             for msg in self.bus.drain() {

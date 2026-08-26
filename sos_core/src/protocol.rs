@@ -23,7 +23,7 @@ use crate::error::{fmt_text, AppError};
 /// (20 usable) unless both sides negotiate a larger one, so a single
 /// `WireMessage` frame at this size will need fragmentation/reassembly at
 /// that transport's edge — not handled here yet.
-pub const WIRE_FRAME_CAP: usize = 144;
+pub const WIRE_FRAME_CAP: usize = 320;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WireMessage {
@@ -65,7 +65,7 @@ impl WireMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::{Name, NAME_CAP, MAX_ARGS, TEXT_CAP};
+    use crate::bus::{AppHealth, Name, NAME_CAP, MAX_APPS, MAX_ARGS, TEXT_CAP};
     use heapless::Vec as HVec;
 
     fn max_name() -> Name {
@@ -86,15 +86,32 @@ mod tests {
         BusMessage::Command { name: max_name(), args }
     }
 
+    fn max_housekeeping() -> BusMessage {
+        let mut apps: HVec<AppHealth, MAX_APPS> = HVec::new();
+        for _ in 0..MAX_APPS {
+            apps.push(AppHealth {
+                name: max_name(),
+                cmd_accepted: u32::MAX,
+                cmd_rejected: u32::MAX,
+                consecutive_tick_failures: u32::MAX,
+            })
+            .unwrap();
+        }
+        BusMessage::Housekeeping { apps }
+    }
+
     /// Pins `WIRE_FRAME_CAP` against the actual worst case across every
     /// `WireMessage` variant, rather than the hand-estimated comment above —
-    /// in particular the newest variant, `CommandResult`. Fails loudly if a
-    /// future change (bigger `TEXT_CAP`, a new variant, more args) outgrows
-    /// the cap, instead of `to_frame` quietly erroring on hardware later.
+    /// in particular a `Bus` frame wrapping a fully-populated
+    /// `Housekeeping`, now the biggest thing on the wire. Fails loudly if a
+    /// future change (bigger `MAX_APPS`/`TEXT_CAP`, a new variant, more
+    /// args) outgrows the cap, instead of `to_frame` quietly erroring on
+    /// hardware later.
     #[test]
     fn every_wire_message_variant_fits_within_wire_frame_cap() {
         let variants = [
             WireMessage::Bus { seq: u32::MAX, msg: max_command() },
+            WireMessage::Bus { seq: u32::MAX, msg: max_housekeeping() },
             WireMessage::Ack { seq: u32::MAX },
             WireMessage::Nack { seq: u32::MAX, reason: NackReason::BusFull },
             WireMessage::CommandResult { seq: u32::MAX, outcome: CommandOutcome::Failed(max_text()) },
