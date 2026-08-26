@@ -17,9 +17,27 @@ pub const MAX_APPS: usize = 8;
 /// watchdog stays silent rather than assuming one was expected.
 const HEARTBEAT_WATCHDOG_TICKS: u32 = 5;
 
+/// Per-app command accept/reject counts — the cFS convention for a cheap
+/// "is this app's command path even alive" check, independent of what any
+/// particular command does. `accepted` counts every `handle_command` call
+/// that returned `Ok`, including ones the app didn't specifically
+/// recognize (the default `App::handle_command` impl is a no-op `Ok`) —
+/// that's what makes a plain, unhandled `"noop"` command a meaningful
+/// liveness probe for every app without each one needing its own case for it.
+#[derive(Default, Clone, Copy)]
+struct CommandCounters {
+    accepted: u32,
+    rejected: u32,
+}
+
+/// Command name that exercises every app's `handle_command` path without
+/// asking any of them to actually do anything — see `CommandCounters`.
+const NOOP_COMMAND: &str = "noop";
+
 pub struct Scheduler<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> {
     bus: Bus,
     apps: HVec<AnyApp, MAX_APPS>,
+    counters: HVec<CommandCounters, MAX_APPS>,
     sink: F,
     command_result_sink: G,
     ticks_since_heartbeat: Option<u32>,
@@ -30,6 +48,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
         Scheduler {
             bus: Bus::new(),
             apps: HVec::new(),
+            counters: HVec::new(),
             sink,
             command_result_sink,
             ticks_since_heartbeat: None,
@@ -40,6 +59,8 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
         self.apps
             .push(app)
             .unwrap_or_else(|_| panic!("too many apps registered (max {MAX_APPS}) — raise MAX_APPS"));
+        // Always pushed in lockstep with `apps` so the two stay index-aligned.
+        let _ = self.counters.push(CommandCounters::default());
     }
 
     pub fn bus_handle(&self) -> BusHandle {
@@ -51,14 +72,14 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
 
         for app in self.apps.iter_mut() {
             if let Err(e) = app.init() {
-                report_fault(&bus_handle, Severity::Error, app.name(), &e);
+                log_event(&bus_handle, Severity::Error, app.name(), &e);
             }
         }
 
         for tick_num in 1..=ticks {
             for app in self.apps.iter_mut() {
                 if let Err(e) = app.tick(&bus_handle) {
-                    report_fault(&bus_handle, Severity::Error, app.name(), format_args!("tick {tick_num}: {e}"));
+                    log_event(&bus_handle, Severity::Error, app.name(), format_args!("tick {tick_num}: {e}"));
                 }
             }
 
@@ -73,10 +94,14 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                     // the command as a whole only succeeds if every app that
                     // recognizes it does — one failing app fails the result.
                     let mut failed = false;
-                    for app in self.apps.iter_mut() {
-                        if let Err(e) = app.handle_command(name.as_str(), args.as_slice()) {
-                            report_fault(&bus_handle, Severity::Error, app.name(), &e);
-                            failed = true;
+                    for (app, counters) in self.apps.iter_mut().zip(self.counters.iter_mut()) {
+                        match app.handle_command(name.as_str(), args.as_slice()) {
+                            Ok(()) => counters.accepted += 1,
+                            Err(e) => {
+                                counters.rejected += 1;
+                                log_event(&bus_handle, Severity::Error, app.name(), &e);
+                                failed = true;
+                            }
                         }
                     }
                     let outcome = if failed {
@@ -85,6 +110,17 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                         CommandOutcome::Success
                     };
                     (self.command_result_sink)(&outcome);
+
+                    if name.as_str() == NOOP_COMMAND {
+                        for (app, counters) in self.apps.iter().zip(self.counters.iter()) {
+                            log_event(
+                                &bus_handle,
+                                Severity::Info,
+                                app.name(),
+                                format_args!("noop: accepted={} rejected={}", counters.accepted, counters.rejected),
+                            );
+                        }
+                    }
                 }
                 (self.sink)(&msg);
             }
@@ -94,7 +130,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
             } else if let Some(missed) = self.ticks_since_heartbeat.as_mut() {
                 *missed += 1;
                 if *missed == HEARTBEAT_WATCHDOG_TICKS {
-                    report_fault(
+                    log_event(
                         &bus_handle,
                         Severity::Critical,
                         "watchdog",
@@ -108,7 +144,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
 
         for app in self.apps.iter_mut() {
             if let Err(e) = app.shutdown() {
-                report_fault(&bus_handle, Severity::Error, app.name(), &e);
+                log_event(&bus_handle, Severity::Error, app.name(), &e);
             }
         }
     }
@@ -125,11 +161,12 @@ impl Scheduler<fn(&BusMessage), fn(&CommandOutcome)> {
     }
 }
 
-/// Turns an app error into a bus `Log` message instead of a local
-/// `eprintln!` — there's no stdout without an OS, and this is what the
-/// bus already exists for. Also fixes the earlier gap where faults were
-/// only ever visible in the satellite's own terminal.
-fn report_fault(bus_handle: &BusHandle, severity: Severity, app_name: &'static str, context: impl fmt::Display) {
+/// Puts an event (a fault, a watchdog trip, a noop confirmation) onto the
+/// bus as a `Log` message instead of a local `eprintln!` — there's no
+/// stdout without an OS, and this is what the bus already exists for. Also
+/// means events are visible on the ground, not just the satellite's own
+/// terminal.
+fn log_event(bus_handle: &BusHandle, severity: Severity, app_name: &'static str, context: impl fmt::Display) {
     let _ = bus_handle.send(BusMessage::Log {
         severity,
         source: Name::try_from(app_name).unwrap_or_default(),
