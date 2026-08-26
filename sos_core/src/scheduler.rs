@@ -11,11 +11,11 @@ use crate::protocol::CommandOutcome;
 
 pub const MAX_APPS: usize = 8;
 
-/// Consecutive ticks with no `BusMessage::Heartbeat` observed on the bus
-/// before the scheduler raises a fault. Only starts counting after the
-/// first heartbeat is seen — if nothing registered ever sends one, the
-/// watchdog stays silent rather than assuming one was expected.
-const HEARTBEAT_WATCHDOG_TICKS: u32 = 5;
+/// Consecutive `tick()` failures for one app before the scheduler declares
+/// it unhealthy — the cFE Health & Safety analog: did this specific app
+/// keep checking in okay, not just "did *some* heartbeat show up on the
+/// bus." A single blip doesn't trip it; a run of them does.
+const APP_UNHEALTHY_TICKS: u32 = 3;
 
 /// Per-app command accept/reject counts — the cFS convention for a cheap
 /// "is this app's command path even alive" check, independent of what any
@@ -38,9 +38,9 @@ pub struct Scheduler<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> {
     bus: Bus,
     apps: HVec<AnyApp, MAX_APPS>,
     counters: HVec<CommandCounters, MAX_APPS>,
+    consecutive_tick_failures: HVec<u32, MAX_APPS>,
     sink: F,
     command_result_sink: G,
-    ticks_since_heartbeat: Option<u32>,
 }
 
 impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
@@ -49,9 +49,9 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
             bus: Bus::new(),
             apps: HVec::new(),
             counters: HVec::new(),
+            consecutive_tick_failures: HVec::new(),
             sink,
             command_result_sink,
-            ticks_since_heartbeat: None,
         }
     }
 
@@ -59,8 +59,9 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
         self.apps
             .push(app)
             .unwrap_or_else(|_| panic!("too many apps registered (max {MAX_APPS}) — raise MAX_APPS"));
-        // Always pushed in lockstep with `apps` so the two stay index-aligned.
+        // Always pushed in lockstep with `apps` so both stay index-aligned.
         let _ = self.counters.push(CommandCounters::default());
+        let _ = self.consecutive_tick_failures.push(0);
     }
 
     pub fn bus_handle(&self) -> BusHandle {
@@ -77,18 +78,35 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
         }
 
         for tick_num in 1..=ticks {
-            for app in self.apps.iter_mut() {
-                if let Err(e) = app.tick(&bus_handle) {
-                    log_event(&bus_handle, Severity::Error, app.name(), format_args!("tick {tick_num}: {e}"));
+            for (app, unhealthy) in self.apps.iter_mut().zip(self.consecutive_tick_failures.iter_mut()) {
+                match app.tick(&bus_handle) {
+                    Ok(()) => {
+                        if *unhealthy >= APP_UNHEALTHY_TICKS {
+                            log_event(
+                                &bus_handle,
+                                Severity::Info,
+                                app.name(),
+                                format_args!("recovered after {unhealthy} consecutive tick failures"),
+                            );
+                        }
+                        *unhealthy = 0;
+                    }
+                    Err(e) => {
+                        *unhealthy += 1;
+                        log_event(&bus_handle, Severity::Error, app.name(), format_args!("tick {tick_num}: {e}"));
+                        if *unhealthy == APP_UNHEALTHY_TICKS {
+                            log_event(
+                                &bus_handle,
+                                Severity::Critical,
+                                app.name(),
+                                format_args!("unhealthy: {APP_UNHEALTHY_TICKS} consecutive tick failures"),
+                            );
+                        }
+                    }
                 }
             }
 
-            let mut heartbeat_seen_this_tick = false;
-
             for msg in self.bus.drain() {
-                if matches!(msg, BusMessage::Heartbeat { .. }) {
-                    heartbeat_seen_this_tick = true;
-                }
                 if let BusMessage::Command { name, args } = &msg {
                     // The satellite shouts commands to every app at once, so
                     // the command as a whole only succeeds if every app that
@@ -123,20 +141,6 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                     }
                 }
                 (self.sink)(&msg);
-            }
-
-            if heartbeat_seen_this_tick {
-                self.ticks_since_heartbeat = Some(0);
-            } else if let Some(missed) = self.ticks_since_heartbeat.as_mut() {
-                *missed += 1;
-                if *missed == HEARTBEAT_WATCHDOG_TICKS {
-                    log_event(
-                        &bus_handle,
-                        Severity::Critical,
-                        "watchdog",
-                        format_args!("no heartbeat in {HEARTBEAT_WATCHDOG_TICKS} ticks"),
-                    );
-                }
             }
 
             delay.delay_ms(tick_interval_ms);
