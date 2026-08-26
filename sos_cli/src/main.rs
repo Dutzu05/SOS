@@ -82,8 +82,8 @@ fn log_to_console(msg: &BusMessage) {
         BusMessage::Heartbeat { app_name } => {
             println!("[bus] heartbeat from {app_name}");
         }
-        BusMessage::Log { source, text } => {
-            println!("[bus] log [{source}] {text}");
+        BusMessage::Log { severity, source, text } => {
+            println!("[bus] {severity:?} [{source}] {text}");
         }
         BusMessage::Command { name, args } => {
             println!("[bus] command received: {name} {args:?}");
@@ -169,6 +169,7 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
                             }
                             _ => {
                                 let _ = bus_handle.send(BusMessage::Log {
+                                    severity: sos_core::Severity::Error,
                                     source: Name::try_from("auth").unwrap(),
                                     text: sos_core::Text::try_from("rejected connection: bad auth token").unwrap(),
                                 });

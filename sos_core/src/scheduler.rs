@@ -5,7 +5,7 @@ use heapless::Vec as HVec;
 
 use crate::app::App;
 use crate::apps::AnyApp;
-use crate::bus::{Bus, BusHandle, BusMessage, Name, Text};
+use crate::bus::{Bus, BusHandle, BusMessage, Name, Severity, Text};
 use crate::error::fmt_text;
 use crate::protocol::CommandOutcome;
 
@@ -51,14 +51,14 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
 
         for app in self.apps.iter_mut() {
             if let Err(e) = app.init() {
-                report_fault(&bus_handle, app.name(), &e);
+                report_fault(&bus_handle, Severity::Error, app.name(), &e);
             }
         }
 
         for tick_num in 1..=ticks {
             for app in self.apps.iter_mut() {
                 if let Err(e) = app.tick(&bus_handle) {
-                    report_fault(&bus_handle, app.name(), format_args!("tick {tick_num}: {e}"));
+                    report_fault(&bus_handle, Severity::Error, app.name(), format_args!("tick {tick_num}: {e}"));
                 }
             }
 
@@ -75,7 +75,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                     let mut failed = false;
                     for app in self.apps.iter_mut() {
                         if let Err(e) = app.handle_command(name.as_str(), args.as_slice()) {
-                            report_fault(&bus_handle, app.name(), &e);
+                            report_fault(&bus_handle, Severity::Error, app.name(), &e);
                             failed = true;
                         }
                     }
@@ -96,6 +96,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
                 if *missed == HEARTBEAT_WATCHDOG_TICKS {
                     report_fault(
                         &bus_handle,
+                        Severity::Critical,
                         "watchdog",
                         format_args!("no heartbeat in {HEARTBEAT_WATCHDOG_TICKS} ticks"),
                     );
@@ -107,7 +108,7 @@ impl<F: FnMut(&BusMessage), G: FnMut(&CommandOutcome)> Scheduler<F, G> {
 
         for app in self.apps.iter_mut() {
             if let Err(e) = app.shutdown() {
-                report_fault(&bus_handle, app.name(), &e);
+                report_fault(&bus_handle, Severity::Error, app.name(), &e);
             }
         }
     }
@@ -128,8 +129,9 @@ impl Scheduler<fn(&BusMessage), fn(&CommandOutcome)> {
 /// `eprintln!` — there's no stdout without an OS, and this is what the
 /// bus already exists for. Also fixes the earlier gap where faults were
 /// only ever visible in the satellite's own terminal.
-fn report_fault(bus_handle: &BusHandle, app_name: &'static str, context: impl fmt::Display) {
+fn report_fault(bus_handle: &BusHandle, severity: Severity, app_name: &'static str, context: impl fmt::Display) {
     let _ = bus_handle.send(BusMessage::Log {
+        severity,
         source: Name::try_from(app_name).unwrap_or_default(),
         text: fmt_text(context),
     });

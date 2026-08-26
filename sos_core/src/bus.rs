@@ -17,11 +17,22 @@ pub const FRAME_CAP: usize = 128;
 pub type Name = HString<NAME_CAP>;
 pub type Text = HString<TEXT_CAP>;
 
+/// How urgently a `Log` message should be treated — lets ground control
+/// (or a future on-board Event Service) filter/prioritize instead of every
+/// log line reading as equally important.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Severity {
+    Debug,
+    Info,
+    Error,
+    Critical,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BusMessage {
     Telemetry { sensor_id: u8, value: f32 },
     Heartbeat { app_name: Name },
-    Log { source: Name, text: Text },
+    Log { severity: Severity, source: Name, text: Text },
     Command { name: Name, args: HVec<Name, MAX_ARGS> },
 }
 
