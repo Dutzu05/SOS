@@ -1,6 +1,6 @@
 use crate::app::App;
-use crate::bus::{BusHandle, BusMessage, Name};
-use crate::error::AppError;
+use crate::bus::{BusHandle, BusMessage, Name, Severity};
+use crate::error::{fmt_text, AppError};
 
 pub struct TempSensorApp {
     sensor_id: u8,
@@ -55,7 +55,6 @@ pub struct BatteryApp {
     charge_level: f32,
     drain_rate: f32,
     fault_threshold: f32,
-    faulted: bool,          // NEW — have we already reported the fault?
 }
 
 impl BatteryApp {
@@ -64,8 +63,7 @@ impl BatteryApp {
             sensor_id,
             charge_level: 100.0, // Starts fully charged
             drain_rate: 5.5,     // How much it drains per tick
-            fault_threshold: 15.0, // Throws an error below this level
-            faulted: false,
+            fault_threshold: 15.0, // The limit this app watches for
         }
     }
 }impl App for BatteryApp {
@@ -74,16 +72,27 @@ impl BatteryApp {
         Ok(())
     }
 
+    /// A minimal fault-detection-isolation-recovery loop: this is the one
+    /// limit this app watches (`fault_threshold`), and crossing it doesn't
+    /// just get reported and left for a human — the app issues the same
+    /// `reset-battery` command ground control could send by hand, right
+    /// here, autonomously. The `Err` still surfaces the breach as a normal
+    /// tick fault (so the scheduler's per-app health tracking sees it too);
+    /// the correction has already happened by the time it does.
     fn tick(&mut self, bus: &BusHandle) -> Result<(), AppError> {
-        if self.faulted {
-            // already reported — do nothing until something resets us
-            return Ok(());
-        }
-
         self.charge_level -= self.drain_rate;
 
         if self.charge_level < self.fault_threshold {
-            self.faulted = true;
+            let breach_level = self.charge_level;
+            let _ = self.handle_command("reset-battery", &[]);
+            let _ = bus.send(BusMessage::Log {
+                severity: Severity::Critical,
+                source: Name::try_from("battery_app").unwrap_or_default(),
+                text: fmt_text(format_args!(
+                    "charge {breach_level:.2} below limit {:.2} — auto-corrected via reset-battery",
+                    self.fault_threshold
+                )),
+            });
             return Err(AppError::SensorFault(self.sensor_id));
         }
 
@@ -96,7 +105,6 @@ impl BatteryApp {
     fn handle_command(&mut self, name: &str, _args: &[Name]) -> Result<(), AppError> {
         if name == "reset-battery" {
             self.charge_level = 100.0;
-            self.faulted = false;
         }
         Ok(())
     }
