@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -247,6 +247,36 @@ fn run_sim(ticks: u32, interval_ms: u64, addr: &str) {
     scheduler.run(ticks, interval_ms as u32, &mut delay);
 }
 
+/// How long ground control waits for an `Ack`/`Nack` before assuming the
+/// frame was lost and resending it. Retries reuse the same `seq`, which is
+/// safe: the satellite either hasn't seen it yet (fine, executes once) or
+/// has already advanced past it and responds `Nack(StaleOrReplayedSeq)`
+/// (which ground control reads as "already delivered", not a failure).
+const ACK_TIMEOUT: Duration = Duration::from_millis(750);
+const MAX_SEND_ATTEMPTS: u32 = 4;
+
+enum AckOutcome {
+    Ack,
+    Nack(sos_core::NackReason),
+}
+
+struct PendingAck {
+    seq: u32,
+    outcome: Option<AckOutcome>,
+}
+
+/// Called from the reader thread when an `Ack`/`Nack` arrives. Only
+/// resolves it if it's for the `seq` the stdin loop is currently waiting
+/// on — a late reply for an earlier, already-resolved attempt is ignored.
+fn resolve_ack(ack_state: &(Mutex<PendingAck>, Condvar), seq: u32, outcome: AckOutcome) {
+    let (lock, cvar) = ack_state;
+    let mut pending = lock.lock().unwrap();
+    if pending.seq == seq && pending.outcome.is_none() {
+        pending.outcome = Some(outcome);
+        cvar.notify_all();
+    }
+}
+
 fn ground_control(addr: &str) {
     // 1. Notice 'mut' is added here so we can write to it!
     let mut stream = TcpStream::connect(addr).expect("failed to connect to satellite");
@@ -261,7 +291,14 @@ fn ground_control(addr: &str) {
 
     // 3. NOW it is safe to clone the stream and start the listening thread
 
+    // Tracks the one command currently awaiting delivery confirmation, so
+    // the stdin loop can block on it and the reader thread can resolve it
+    // when an `Ack`/`Nack` for that `seq` comes back.
+    let ack_state: Arc<(Mutex<PendingAck>, Condvar)> =
+        Arc::new((Mutex::new(PendingAck { seq: 0, outcome: None }), Condvar::new()));
+
     let reader_stream = stream.try_clone().expect("failed to clone stream");
+    let reader_ack_state = Arc::clone(&ack_state);
     thread::spawn(move || {
         let mut reader = BufReader::new(reader_stream);
         let mut frame = Vec::new();
@@ -284,8 +321,14 @@ fn ground_control(addr: &str) {
                         last_seq = Some(seq);
                         println!("[ground] <- #{seq} {msg:?}");
                     }
-                    Ok(WireMessage::Ack { seq }) => println!("[ground] <- ACK #{seq}"),
-                    Ok(WireMessage::Nack { seq, reason }) => println!("[ground] <- NACK #{seq}: {reason:?}"),
+                    Ok(WireMessage::Ack { seq }) => {
+                        println!("[ground] <- ACK #{seq}");
+                        resolve_ack(&reader_ack_state, seq, AckOutcome::Ack);
+                    }
+                    Ok(WireMessage::Nack { seq, reason }) => {
+                        println!("[ground] <- NACK #{seq}: {reason:?}");
+                        resolve_ack(&reader_ack_state, seq, AckOutcome::Nack(reason));
+                    }
                     Ok(WireMessage::CommandResult { seq, outcome }) => {
                         println!("[ground] <- result #{seq}: {outcome:?}")
                     }
@@ -342,14 +385,68 @@ fn ground_control(addr: &str) {
             seq: uplink_seq,
             msg: BusMessage::Command { name, args },
         };
-        match wire.to_frame() {
-            Ok(frame) => {
-                if let Err(e) = writer.write_all(&frame) {
-                    eprintln!("[ground] failed to send command: {e}");
+        let frame = match wire.to_frame() {
+            Ok(frame) => frame,
+            Err(e) => {
+                eprintln!("[ground] failed to serialize command: {e}");
+                continue;
+            }
+        };
+
+        {
+            let (lock, _) = &*ack_state;
+            *lock.lock().unwrap() = PendingAck { seq: uplink_seq, outcome: None };
+        }
+
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            if let Err(e) = writer.write_all(&frame) {
+                eprintln!("[ground] failed to send command: {e}");
+                return;
+            }
+
+            let (lock, cvar) = &*ack_state;
+            let pending = lock.lock().unwrap();
+            let (pending, wait_result) = cvar
+                .wait_timeout_while(pending, ACK_TIMEOUT, |p| p.outcome.is_none())
+                .unwrap();
+
+            match &pending.outcome {
+                Some(AckOutcome::Ack) => {
+                    println!("[ground] #{uplink_seq} delivered");
                     break;
                 }
+                Some(AckOutcome::Nack(sos_core::NackReason::StaleOrReplayedSeq)) => {
+                    println!("[ground] #{uplink_seq} already delivered on an earlier attempt");
+                    break;
+                }
+                Some(AckOutcome::Nack(sos_core::NackReason::BusFull)) => {
+                    if attempt >= MAX_SEND_ATTEMPTS {
+                        println!("[ground] #{uplink_seq} bus still full after {attempt} attempts, giving up");
+                        break;
+                    }
+                    println!("[ground] #{uplink_seq} bus full, retrying (attempt {}/{MAX_SEND_ATTEMPTS})", attempt + 1);
+                    drop(pending);
+                    let (lock, _) = &*ack_state;
+                    lock.lock().unwrap().outcome = None;
+                    continue;
+                }
+                Some(AckOutcome::Nack(reason)) => {
+                    println!("[ground] #{uplink_seq} rejected: {reason:?}");
+                    break;
+                }
+                None => {
+                    debug_assert!(wait_result.timed_out());
+                    if attempt >= MAX_SEND_ATTEMPTS {
+                        println!("[ground] #{uplink_seq} got no response after {attempt} attempts, giving up");
+                        break;
+                    }
+                    println!("[ground] #{uplink_seq} timed out waiting for ACK, retrying (attempt {}/{MAX_SEND_ATTEMPTS})", attempt + 1);
+                    drop(pending);
+                    continue;
+                }
             }
-            Err(e) => eprintln!("[ground] failed to serialize command: {e}"),
         }
     }
 }

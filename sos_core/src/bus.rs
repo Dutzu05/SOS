@@ -87,3 +87,33 @@ impl Default for Bus {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins `FRAME_CAP` against the actual worst case instead of the eyeballed
+    /// "~90 bytes" comment: a `Command` with a max-length name and `MAX_ARGS`
+    /// max-length args. Fails loudly (rather than a silent `to_frame` error
+    /// on hardware) if a future change to `NAME_CAP`/`MAX_ARGS` outgrows the cap.
+    #[test]
+    fn command_frame_fits_within_frame_cap() {
+        let max_name = || {
+            let bytes = [b'A'; NAME_CAP];
+            Name::try_from(core::str::from_utf8(&bytes).unwrap()).unwrap()
+        };
+
+        let mut args: HVec<Name, MAX_ARGS> = HVec::new();
+        for _ in 0..MAX_ARGS {
+            args.push(max_name()).unwrap();
+        }
+        let msg = BusMessage::Command { name: max_name(), args };
+
+        let frame = msg.to_frame().expect("worst-case Command must fit in FRAME_CAP");
+        assert!(
+            frame.len() <= FRAME_CAP,
+            "worst-case Command frame is {} bytes, only {FRAME_CAP} bytes of headroom",
+            frame.len()
+        );
+    }
+}
