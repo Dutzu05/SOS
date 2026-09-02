@@ -1,3 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["sos_core", "sos_cli", "sos_fw"]
+members = ["sos_core", "sos_cli"]
+exclude = ["sos_fw"]

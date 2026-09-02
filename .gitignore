@@ -1,4 +1,5 @@
 /target
+sos_fw/target
 
 # Shared ground-station/satellite auth secret, baked in at compile time via
 # include_bytes! in sos_core/src/auth.rs. Never commit the real key —
