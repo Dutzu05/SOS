@@ -12,7 +12,8 @@ use sos_core::{BusMessage, Scheduler};
 esp_bootloader_esp_idf::esp_app_desc!();
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    esp_println::println!("panic: {info}");
     loop {}
 }
 
@@ -25,11 +26,31 @@ fn main() -> ! {
 
     let mut scheduler = Scheduler::new(
         move |msg: &BusMessage| {
-            if let BusMessage::Heartbeat { .. } = msg {
-                led.toggle();
+            match msg {
+                BusMessage::Heartbeat { .. } => led.toggle(),
+                BusMessage::Telemetry { sensor_id, value } => {
+                    esp_println::println!("telemetry: sensor={sensor_id} value={value:.2}");
+                }
+                BusMessage::Log { severity, source, text } => {
+                    esp_println::println!("log: [{severity:?}] {source}: {text}");
+                }
+                BusMessage::Command { name, .. } => {
+                    esp_println::println!("command: {name}");
+                }
+                BusMessage::Housekeeping { apps } => {
+                    for app in apps {
+                        esp_println::println!(
+                            "hk: {} accepted={} rejected={} unhealthy_ticks={}",
+                            app.name,
+                            app.cmd_accepted,
+                            app.cmd_rejected,
+                            app.consecutive_tick_failures
+                        );
+                    }
+                }
             }
         },
-        |_outcome| {},
+        |outcome| esp_println::println!("command outcome: {outcome:?}"),
     );
 
     scheduler.register(AnyApp::Heartbeat(HeartbeatApp));

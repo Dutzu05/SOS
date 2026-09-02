@@ -11,6 +11,7 @@ path = "src/main.rs"
 sos-core = { path = "../sos_core" }
 esp-hal = { version = "1.0.0-beta.0", features = ["esp32c3", "unstable"] }
 esp-bootloader-esp-idf = { version = "0.6", features = ["esp32c3"] }
+esp-println = { version = "0.18.0", features = ["esp32c3"] }
 
 [profile.release]
 opt-level = "s"
